@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>茶指紋色彩辨識系統</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #fff; text-align: center; }
+        header { padding: 12px; background: #1f1f1f; border-bottom: 1px solid #333; font-size: 16px; font-weight: bold; color: #4db6ac; }
+        
+        .camera-container { position: relative; width: 100vw; height: 60vh; background: #000; overflow: hidden; display: flex; justify-content: center; align-items: center; }
+        video { width: 100%; height: 100%; object-fit: cover; }
+        
+        /* 中央瞄準框 ROI */
+        .roi-box {
+            position: absolute; width: 100px; height: 100px;
+            border: 3px solid #00e676; border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,230,118,0.5);
+            pointer-events: none; display: flex; justify-content: center; align-items: center;
+        }
+        .roi-box::after { content: "對準取樣點"; font-size: 10px; color: #fff; background: rgba(0,0,0,0.6); padding: 2px 4px; border-radius: 3px; }
+
+        .control-panel { padding: 15px; background: #1f1f1f; min-height: 35vh; }
+        .step-title { font-size: 18px; margin-bottom: 12px; font-weight: bold; color: #ffca28; }
+        
+        button {
+            background: #00897b; color: white; border: none; padding: 14px 28px;
+            font-size: 16px; font-weight: bold; border-radius: 25px;
+            cursor: pointer; width: 80%; max-width: 300px; margin: 8px 0;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        button:active { background: #00695c; transform: scale(0.98); }
+        button.reset { background: #d32f2f; margin-top: 10px; }
+
+        /* 結果清單 */
+        .result-card { background: #2c2c2c; border-radius: 8px; padding: 12px; margin: 8px 0; text-align: left; }
+        .result-card.best { border: 2px solid #00e676; background: #1b3a2b; }
+        .result-title { font-size: 16px; font-weight: bold; margin-bottom: 4px; }
+        .result-detail { font-size: 12px; color: #bbb; }
+
+        canvas { display: none; }
+    </style>
+</head>
+<body>
+
+    <header>茶指紋色彩辨識系統 (Web 版)</header>
+
+    <div class="camera-container">
+        <video id="webcam" autoplay playsinline muted></video>
+        <div class="roi-box" id="roiBox"></div>
+    </div>
+
+    <div class="control-panel">
+        <div class="step-title" id="stepTitle">步驟 1/6: 請掃描空白標準（白板）</div>
+        <button id="scanBtn" onclick="captureStep()">拍照並擷取色彩</button>
+        <div id="resultsArea" style="display:none;"></div>
+        <button class="reset" onclick="resetAll()">重新檢測</button>
+    </div>
+
+    <!-- 用於計算圖像畫素的隱藏 Canvas -->
+    <canvas id="canvas"></canvas>
+
+<script>
+    // 茶葉指紋資料庫 (可自行擴充)
+    const teaDatabase = [
+        {
+            name: "高山烏龍茶",
+            reactions: [
+                {r: 210, g: 180, b: 80},
+                {r: 190, g: 150, b: 60},
+                {r: 160, g: 200, b: 90},
+                {r: 220, g: 210, b: 120},
+                {r: 180, g: 140, b: 50}
+            ]
+        },
+        {
+            name: "日月潭紅茶",
+            reactions: [
+                {r: 150, g: 50, b: 30},
+                {r: 130, g: 40, b: 25},
+                {r: 180, g: 70, b: 40},
+                {r: 110, g: 30, b: 20},
+                {r: 160, g: 60, b: 35}
+            ]
+        }
+    ];
+
+    let currentStep = 0; // 0: 白板, 1~5: R1~R5, 6: 結果
+    let whiteRef = null;
+    let rawReactions = [];
+    let calReactions = [];
+
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('canvas');
+    const stepTitle = document.getElementById('stepTitle');
+    const scanBtn = document.getElementById('scanBtn');
+    const resultsArea = document.getElementById('resultsArea');
+    const roiBox = document.getElementById('roiBox');
+
+    // 1. 啟動手機後鏡頭 (WebRTC)
+    async function initCamera() {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                video: { facingMode: { exact: "environment" } }, // 強制後鏡頭
+                audio: false
+            });
+            video.srcObject = stream;
+        } catch (err) {
+            // 若後鏡頭無法使用，退回預設鏡頭
+            const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            video.srcObject = fallbackStream;
+        }
+    }
+
+    // 2. 擷取 ROI 區域 RGB 平均值
+    function captureStep() {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+        // 取中心 100x100 像素
+        const centerX = Math.floor(canvas.width / 2);
+        const centerY = Math.floor(canvas.height / 2);
+        const roiSize = 50; 
+
+        const imgData = ctx.getImageData(centerX - roiSize, centerY - roiSize, roiSize * 2, roiSize * 2);
+        const pixels = imgData.data;
+
+        let sumR = 0, sumG = 0, sumB = 0, count = 0;
+        for (let i = 0; i < pixels.length; i += 4) {
+            sumR += pixels[i];
+            sumG += pixels[i+1];
+            sumB += pixels[i+2];
+            count++;
+        }
+
+        const rawColor = { r: sumR / count, g: sumG / count, b: sumB / count };
+
+        if (currentStep === 0) {
+            whiteRef = rawColor;
+            currentStep++;
+            updateUI();
+        } else if (currentStep >= 1 && currentStep <= 5) {
+            rawReactions.push(rawColor);
+            
+            // 白板校正公式: Cal = min(255, (Raw / White) * 255)
+            const calR = Math.min(255, (rawColor.r / whiteRef.r) * 255);
+            const calG = Math.min(255, (rawColor.g / whiteRef.g) * 255);
+            const calB = Math.min(255, (rawColor.b / whiteRef.b) * 255);
+            calReactions.push({ r: calR, g: calG, b: calB });
+
+            currentStep++;
+            updateUI();
+        }
+    }
+
+    // 3. 歸一化 RGB 轉換
+    function normalize(rgb) {
+        const sum = rgb.r + rgb.g + rgb.b;
+        if (sum === 0) return { r: 0, g: 0, b: 0 };
+        return { r: rgb.r / sum, g: rgb.g / sum, b: rgb.b / sum };
+    }
+
+    // 4. 比對與計算匹配度
+    function calculateResults() {
+        const results = teaDatabase.map(tea => {
+            let totalDist = 0;
+            let within10Percent = true;
+
+            for (let i = 0; i < 5; i++) {
+                const sampleCal = calReactions[i];
+                const targetDb = tea.reactions[i];
+
+                // Check +-10% tolerance
+                if (Math.abs(sampleCal.r - targetDb.r) > targetDb.r * 0.10 ||
+                    Math.abs(sampleCal.g - targetDb.g) > targetDb.g * 0.10 ||
+                    Math.abs(sampleCal.b - targetDb.b) > targetDb.b * 0.10) {
+                    within10Percent = false;
+                }
+
+                // 歐幾里得距離 (使用歸一化 RGB 抗亮度干擾)
+                const sNorm = normalize(sampleCal);
+                const tNorm = normalize(targetDb);
+                const dist = Math.sqrt(
+                    Math.pow(sNorm.r - tNorm.r, 2) +
+                    Math.pow(sNorm.g - tNorm.g, 2) +
+                    Math.pow(sNorm.b - tNorm.b, 2)
+                );
+                totalDist += dist;
+            }
+
+            const confidence = Math.max(0, (1.0 - (totalDist / 5.0)) * 100);
+            return {
+                name: tea.name,
+                distance: totalDist,
+                confidence: confidence.toFixed(1),
+                isMatch: within10Percent
+            };
+        });
+
+        results.sort((a, b) => a.distance - b.distance);
+
+        // 渲染結果 UI
+        resultsArea.innerHTML = "";
+        results.forEach((res, index) => {
+            const card = document.createElement('div');
+            card.className = `result-card ${index === 0 ? 'best' : ''}`;
+            card.innerHTML = `
+                <div class="result-title">${res.name} ${index === 0 ? '★ 最佳匹配' : ''}</div>
+                <div class="result-detail">相似信心度：${res.confidence}%</div>
+                <div class="result-detail">±10% 容許範圍：${res.isMatch ? '✅ 符合' : '❌ 超出'}</div>
+            `;
+            resultsArea.appendChild(card);
+        });
+    }
+
+    // 5. UI 狀態切換
+    function updateUI() {
+        if (currentStep === 0) {
+            stepTitle.innerText = "步驟 1/6: 請掃描空白標準（白板）";
+        } else if (currentStep <= 5) {
+            stepTitle.innerText = `步驟 ${currentStep + 1}/6: 請掃描呈色 R${currentStep}`;
+        } else {
+            stepTitle.innerText = "比對完成！結果如下：";
+            scanBtn.style.display = "none";
+            roiBox.style.display = "none";
+            resultsArea.style.display = "block";
+            calculateResults();
+        }
+    }
+
+    function resetAll() {
+        currentStep = 0;
+        whiteRef = null;
+        rawReactions = [];
+        calReactions = [];
+        scanBtn.style.display = "inline-block";
+        roiBox.style.display = "flex";
+        resultsArea.style.display = "none";
+        updateUI();
+    }
+
+    window.onload = initCamera;
+</script>
+</body>
+</html>
+，
+
